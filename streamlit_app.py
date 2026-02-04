@@ -24,20 +24,26 @@ db = get_db()
 
 def clean_data_for_excel(data_list):
     """
-    Pulisce i dati per Excel: converte le date Firestore (con fuso orario)
-    in semplici stringhe di testo per evitare errori.
+    Pulisce i dati per Excel: converte date in stringhe e formatta gli appunti raccolti.
     """
     cleaned_list = []
     for item in data_list:
         new_item = item.copy()
-        # Rimuoviamo chiavi interne di ordinamento se presenti
         if '_dt' in new_item: del new_item['_dt']
         
+        # Formattazione speciale per la lista degli appunti salvati
+        if 'note_raccolte' in new_item and isinstance(new_item['note_raccolte'], list):
+            # Converte la lista di oggetti in una stringa leggibile (Es: "Mario: nota...\nLuigi: nota...")
+            text_notes = ""
+            for note in new_item['note_raccolte']:
+                text_notes += f"[{note['autore']}]: {note['testo']}\n"
+            new_item['note_raccolte'] = text_notes
+
         # Scorriamo tutte le chiavi e convertiamo le date in stringhe
         for k, v in new_item.items():
             if isinstance(v, datetime):
-                # Formato: 2023-10-25 14:30
                 new_item[k] = v.strftime('%Y-%m-%d %H:%M:%S')
+                
         cleaned_list.append(new_item)
     return cleaned_list
 
@@ -57,13 +63,16 @@ if 'user' not in st.session_state:
                 "ruolo": ruolo,
                 "online": True,
                 "ultimo_accesso": firestore.SERVER_TIMESTAMP,
-                "appunti_temp": "" 
+                # Campo temporaneo per gli appunti del topic CORRENTE
+                "appunti_topic_corrente": "" 
             }
+            # Salvataggio con merge per non perdere dati
             db.collection("partecipanti").document(nome).set(user_data, merge=True)
             
+            # Recuperiamo il valore attuale dal DB (utile se rientra dopo crash)
             doc = db.collection("partecipanti").document(nome).get()
             if doc.exists:
-                user_data['appunti_temp'] = doc.to_dict().get('appunti_temp', "")
+                user_data['appunti_topic_corrente'] = doc.to_dict().get('appunti_topic_corrente', "")
 
             st.session_state.user = user_data
             st.rerun()
@@ -72,8 +81,15 @@ else:
     # --- UTENTE LOGGATO ---
     me = st.session_state.user
     is_admin = me['ruolo'] == "Capo Gruppo"
-
     current_user_ref = db.collection("partecipanti").document(me['nome'])
+
+    # Sync Appunti dal DB alla Sessione (per assicurarsi che siano puliti quando l'admin chiude il topic)
+    # Leggiamo lo stato aggiornato dal DB
+    remote_user_data = current_user_ref.get().to_dict()
+    if remote_user_data:
+        # Se nel DB è vuoto ma in locale ho testo, significa che è stato resettato dall'admin?
+        # No, fidiamoci del DB. Se l'admin ha pulito, nel DB è vuoto.
+        st.session_state.user['appunti_topic_corrente'] = remote_user_data.get('appunti_topic_corrente', "")
 
     with st.sidebar:
         st.header(me['nome'])
@@ -109,24 +125,25 @@ else:
     tab1, tab2, tab3, tab4 = st.tabs(["Discussione Live", "Gestione Argomenti", "Partecipanti", "Archivio"])
 
     # ---------------------------------------------------------
-    # TAB 1: DISCUSSIONE LIVE + APPUNTI
+    # TAB 1: DISCUSSIONE LIVE + APPUNTI TOPIC
     # ---------------------------------------------------------
     with tab1:
+        # Recupera Argomento Attivo
+        topics_ref = db.collection("topics").where("stato", "==", "attivo").stream()
+        active_topic = None
+        active_topic_id = None
+        for t in topics_ref:
+            active_topic = t.to_dict()
+            active_topic_id = t.id
+        
         col_live, col_notes = st.columns([2, 1])
 
-        with col_live:
-            topics_ref = db.collection("topics").where("stato", "==", "attivo").stream()
-            active_topic = None
-            active_topic_id = None
-            for t in topics_ref:
-                active_topic = t.to_dict()
-                active_topic_id = t.id
-            
-            if active_topic:
+        if active_topic:
+            with col_live:
                 if active_topic.get('privato') and not is_admin:
                     st.warning("Discussione privata in corso (Riservata ai Capi Gruppo).")
                 else:
-                    st.info(f"ARGOMENTO ATTUALE: {active_topic['titolo']}")
+                    st.info(f"ARGOMENTO: {active_topic['titolo']}")
                     st.write(f"{active_topic['descrizione']}")
                     
                     tags = []
@@ -140,11 +157,7 @@ else:
                     with c_btn:
                         st.write("**Azioni:**")
                         if st.button("Prenotati per parlare"):
-                            queue_data = {
-                                "nome": me['nome'],
-                                "topic_id": active_topic_id,
-                                "timestamp": time.time()
-                            }
+                            queue_data = {"nome": me['nome'], "topic_id": active_topic_id, "timestamp": time.time()}
                             db.collection("coda").document(me['nome']).set(queue_data)
                             st.success("Sei in coda.")
                         
@@ -159,17 +172,12 @@ else:
                             q_d = q.to_dict()
                             q_d['id'] = q.id
                             queue_list.append(q_d)
-                        
                         queue_list.sort(key=lambda x: x['timestamp'])
 
-                        if not queue_list:
-                            st.write("Nessuna prenotazione.")
-                        
+                        if not queue_list: st.write("Nessuna prenotazione.")
                         for idx, q_data in enumerate(queue_list):
                             col_q1, col_q2 = st.columns([4, 1])
-                            with col_q1:
-                                st.write(f"{idx + 1}. {q_data['nome']}")
-                            
+                            with col_q1: st.write(f"{idx + 1}. {q_data['nome']}")
                             if is_admin:
                                 with col_q2:
                                     if st.button("X", key=f"del_{q_data['id']}"):
@@ -178,26 +186,65 @@ else:
 
                     if is_admin:
                         st.write("---")
-                        if st.button("Concludi Argomento"):
-                            db.collection("topics").document(active_topic_id).update({"stato": "concluso", "fine": firestore.SERVER_TIMESTAMP})
+                        # LOGICA DI CHIUSURA ARGOMENTO E RACCOLTA APPUNTI
+                        if st.button("✅ Concludi Argomento e Salva Note"):
                             batch = db.batch()
-                            q_del = db.collection("coda").where("topic_id", "==", active_topic_id).stream()
-                            for q in q_del: batch.delete(q.reference)
-                            batch.commit()
-                            st.rerun()
-            else:
-                st.info("Nessun argomento attivo. Selezionane uno dalla scheda 'Gestione Argomenti'.")
+                            
+                            # 1. Recupera gli appunti da TUTTI i partecipanti
+                            all_users = db.collection("partecipanti").stream()
+                            collected_notes = []
+                            
+                            for user_doc in all_users:
+                                u_data = user_doc.to_dict()
+                                notes = u_data.get('appunti_topic_corrente', '').strip()
+                                if notes:
+                                    collected_notes.append({
+                                        "autore": u_data['nome'],
+                                        "testo": notes
+                                    })
+                                    # Resetta il campo appunti dell'utente nel batch
+                                    batch.update(user_doc.reference, {"appunti_topic_corrente": ""})
+                            
+                            # 2. Aggiorna il Topic con stato concluso e le note raccolte
+                            topic_ref = db.collection("topics").document(active_topic_id)
+                            batch.update(topic_ref, {
+                                "stato": "concluso", 
+                                "fine": firestore.SERVER_TIMESTAMP,
+                                "note_raccolte": collected_notes
+                            })
 
-        with col_notes:
-            st.subheader("I tuoi Appunti")
-            st.caption("Scrivi qui le tue note o idee. Vengono salvate automaticamente.")
-            initial_notes = st.session_state.user.get('appunti_temp', "")
-            notes_input = st.text_area("Blocco note", value=initial_notes, height=400, key="widget_notes")
-            
-            if notes_input != initial_notes:
-                st.session_state.user['appunti_temp'] = notes_input
-                current_user_ref.update({"appunti_temp": notes_input})
-                st.caption("Salvataggio...")
+                            # 3. Pulisci coda
+                            q_del = db.collection("coda").where("topic_id", "==", active_topic_id).stream()
+                            for q in q_del: 
+                                batch.delete(q.reference)
+                            
+                            batch.commit()
+                            
+                            # Resetta anche session state locale
+                            st.session_state.user['appunti_topic_corrente'] = ""
+                            st.success("Argomento concluso e appunti salvati!")
+                            time.sleep(1) # Un piccolo delay per far leggere
+                            st.rerun()
+
+            # COLONNA APPUNTI (Visibile se c'è un topic attivo)
+            if not (active_topic.get('privato') and not is_admin):
+                with col_notes:
+                    st.subheader("I tuoi Appunti")
+                    st.caption(f"Note per: **{active_topic['titolo']}**")
+                    st.caption("Al termine dell'argomento verranno salvate e il foglio pulito.")
+                    
+                    initial_notes = st.session_state.user.get('appunti_topic_corrente', "")
+                    # Usiamo key dinamica basata sul topic ID per forzare reset visivo se cambia topic
+                    notes_input = st.text_area("Scrivi qui...", value=initial_notes, height=400, key=f"notes_{active_topic_id}")
+                    
+                    if notes_input != initial_notes:
+                        st.session_state.user['appunti_topic_corrente'] = notes_input
+                        current_user_ref.update({"appunti_topic_corrente": notes_input})
+        else:
+            with col_live:
+                st.info("Nessun argomento attivo. Selezionane uno dalla scheda 'Gestione Argomenti'.")
+            with col_notes:
+                st.write("Attendi l'avvio di un argomento per prendere appunti.")
 
     # ---------------------------------------------------------
     # TAB 2: GESTIONE ARGOMENTI
@@ -210,7 +257,6 @@ else:
             with st.form("new_topic"):
                 t_titolo = st.text_input("Titolo")
                 t_desc = st.text_area("Descrizione")
-                
                 c1, c2, c3 = st.columns(3)
                 t_urgente = c1.checkbox("Urgente")
                 t_privato = c2.checkbox("Privato (Solo Capi)")
@@ -225,7 +271,8 @@ else:
                         "delicato": t_delicato,
                         "proponente": me['nome'],
                         "stato": "proposto",
-                        "data": firestore.SERVER_TIMESTAMP
+                        "data": firestore.SERVER_TIMESTAMP,
+                        "note_raccolte": []
                     })
                     st.success("Inserito.")
 
@@ -245,13 +292,18 @@ else:
                     
                     if is_admin:
                         if st.button("Avvia Discussione", key=f"start_{p.id}"):
+                            # Chiusura forzata vecchi
                             old_active = db.collection("topics").where("stato", "==", "attivo").stream()
-                            for old in old_active: old.reference.update({"stato": "concluso"})
-                            db.collection("topics").document(p.id).update({"stato": "attivo"})
+                            batch_start = db.batch()
+                            for old in old_active: 
+                                batch_start.update(old.reference, {"stato": "concluso"})
+                            
+                            batch_start.update(db.collection("topics").document(p.id), {"stato": "attivo"})
+                            batch_start.commit()
                             st.rerun()
 
         with col_hist:
-            st.subheader("Cronologia")
+            st.subheader("Cronologia & Verbali")
             h_stream = db.collection("topics").where("stato", "==", "concluso").stream()
             h_list = []
             for h in h_stream:
@@ -264,9 +316,17 @@ else:
             h_list.sort(key=lambda x: x['_dt'], reverse=True)
             
             for item in h_list:
-                st.markdown(f"**{item['titolo']}**")
-                st.caption(item.get('descrizione', ''))
-                st.divider()
+                with st.expander(f"✅ {item['titolo']}"):
+                    st.caption(item.get('descrizione', ''))
+                    
+                    # Mostra note raccolte
+                    notes = item.get('note_raccolte', [])
+                    if notes:
+                        st.markdown("**Appunti salvati:**")
+                        for n in notes:
+                            st.markdown(f"- **{n['autore']}**: {n['testo']}")
+                    else:
+                        st.write("_Nessun appunto salvato._")
 
     # ---------------------------------------------------------
     # TAB 3: PARTECIPANTI
@@ -291,16 +351,23 @@ else:
     with tab4:
         st.subheader("Operazioni di Archiviazione")
         
-        # 1. EXPORT EXCEL (Corretto con pulizia date)
+        # 1. EXPORT EXCEL
         if 'h_list' in locals() and h_list:
-            # Pulizia dati Cronologia
             data_topics = clean_data_for_excel(h_list)
             df_topics = pd.DataFrame(data_topics)
+            
+            # Ordine colonne preferito
+            cols = ['titolo', 'descrizione', 'note_raccolte', 'proponente', 'urgente', 'delicato']
+            # Filtra solo colonne esistenti
+            cols = [c for c in cols if c in df_topics.columns]
+            df_topics = df_topics[cols]
 
-            # Pulizia dati Presenti
             pres_now = [u.to_dict() for u in db.collection("partecipanti").stream()]
             data_users = clean_data_for_excel(pres_now)
             df_users = pd.DataFrame(data_users)
+            # Rimuovi campo appunti tecnici dai presenti
+            if 'appunti_topic_corrente' in df_users.columns:
+                df_users = df_users.drop(columns=['appunti_topic_corrente'])
 
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
@@ -348,6 +415,10 @@ else:
                 st.write(f"**Topics ({len(topic_list)}):**")
                 for t in topic_list:
                     st.write(f"- {t.get('titolo', '???')}")
+                    # Mostra un'anteprima delle note anche qui
+                    if t.get('note_raccolte'):
+                        st.caption(f"  *({len(t['note_raccolte'])} note salvate)*")
+
                 st.write("---")
                 user_list = a_data.get('presenti', [])
                 st.write(f"**Presenti ({len(user_list)}):**")
