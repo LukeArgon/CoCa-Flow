@@ -24,22 +24,21 @@ db = get_db()
 
 def clean_data_for_excel(data_list):
     """
-    Pulisce i dati per Excel: converte date in stringhe e formatta gli appunti raccolti.
+    Pulisce i dati per il primo foglio Excel (Riepilogo Topic).
     """
     cleaned_list = []
     for item in data_list:
         new_item = item.copy()
         if '_dt' in new_item: del new_item['_dt']
         
-        # Formattazione speciale per la lista degli appunti salvati
+        # Sintetizza le note in una singola stringa per il foglio riepilogo
         if 'note_raccolte' in new_item and isinstance(new_item['note_raccolte'], list):
-            # Converte la lista di oggetti in una stringa leggibile (Es: "Mario: nota...\nLuigi: nota...")
             text_notes = ""
             for note in new_item['note_raccolte']:
                 text_notes += f"[{note['autore']}]: {note['testo']}\n"
             new_item['note_raccolte'] = text_notes
 
-        # Scorriamo tutte le chiavi e convertiamo le date in stringhe
+        # Converti date
         for k, v in new_item.items():
             if isinstance(v, datetime):
                 new_item[k] = v.strftime('%Y-%m-%d %H:%M:%S')
@@ -63,13 +62,10 @@ if 'user' not in st.session_state:
                 "ruolo": ruolo,
                 "online": True,
                 "ultimo_accesso": firestore.SERVER_TIMESTAMP,
-                # Campo temporaneo per gli appunti del topic CORRENTE
                 "appunti_topic_corrente": "" 
             }
-            # Salvataggio con merge per non perdere dati
             db.collection("partecipanti").document(nome).set(user_data, merge=True)
             
-            # Recuperiamo il valore attuale dal DB (utile se rientra dopo crash)
             doc = db.collection("partecipanti").document(nome).get()
             if doc.exists:
                 user_data['appunti_topic_corrente'] = doc.to_dict().get('appunti_topic_corrente', "")
@@ -83,12 +79,9 @@ else:
     is_admin = me['ruolo'] == "Capo Gruppo"
     current_user_ref = db.collection("partecipanti").document(me['nome'])
 
-    # Sync Appunti dal DB alla Sessione (per assicurarsi che siano puliti quando l'admin chiude il topic)
-    # Leggiamo lo stato aggiornato dal DB
+    # Sync Appunti
     remote_user_data = current_user_ref.get().to_dict()
     if remote_user_data:
-        # Se nel DB è vuoto ma in locale ho testo, significa che è stato resettato dall'admin?
-        # No, fidiamoci del DB. Se l'admin ha pulito, nel DB è vuoto.
         st.session_state.user['appunti_topic_corrente'] = remote_user_data.get('appunti_topic_corrente', "")
 
     with st.sidebar:
@@ -125,10 +118,9 @@ else:
     tab1, tab2, tab3, tab4 = st.tabs(["Discussione Live", "Gestione Argomenti", "Partecipanti", "Archivio"])
 
     # ---------------------------------------------------------
-    # TAB 1: DISCUSSIONE LIVE + APPUNTI TOPIC
+    # TAB 1: DISCUSSIONE LIVE
     # ---------------------------------------------------------
     with tab1:
-        # Recupera Argomento Attivo
         topics_ref = db.collection("topics").where("stato", "==", "attivo").stream()
         active_topic = None
         active_topic_id = None
@@ -186,11 +178,10 @@ else:
 
                     if is_admin:
                         st.write("---")
-                        # LOGICA DI CHIUSURA ARGOMENTO E RACCOLTA APPUNTI
+                        # CHIUSURA E SALVATAGGIO NOTE + RUOLO
                         if st.button("✅ Concludi Argomento e Salva Note"):
                             batch = db.batch()
                             
-                            # 1. Recupera gli appunti da TUTTI i partecipanti
                             all_users = db.collection("partecipanti").stream()
                             collected_notes = []
                             
@@ -198,14 +189,14 @@ else:
                                 u_data = user_doc.to_dict()
                                 notes = u_data.get('appunti_topic_corrente', '').strip()
                                 if notes:
+                                    # SALVIAMO ANCHE IL RUOLO DELL'UTENTE
                                     collected_notes.append({
                                         "autore": u_data['nome'],
+                                        "ruolo": u_data['ruolo'], # Importante per l'Excel
                                         "testo": notes
                                     })
-                                    # Resetta il campo appunti dell'utente nel batch
                                     batch.update(user_doc.reference, {"appunti_topic_corrente": ""})
                             
-                            # 2. Aggiorna il Topic con stato concluso e le note raccolte
                             topic_ref = db.collection("topics").document(active_topic_id)
                             batch.update(topic_ref, {
                                 "stato": "concluso", 
@@ -213,45 +204,35 @@ else:
                                 "note_raccolte": collected_notes
                             })
 
-                            # 3. Pulisci coda
                             q_del = db.collection("coda").where("topic_id", "==", active_topic_id).stream()
-                            for q in q_del: 
-                                batch.delete(q.reference)
+                            for q in q_del: batch.delete(q.reference)
                             
                             batch.commit()
-                            
-                            # Resetta anche session state locale
                             st.session_state.user['appunti_topic_corrente'] = ""
                             st.success("Argomento concluso e appunti salvati!")
-                            time.sleep(1) # Un piccolo delay per far leggere
+                            time.sleep(1)
                             st.rerun()
 
-            # COLONNA APPUNTI (Visibile se c'è un topic attivo)
             if not (active_topic.get('privato') and not is_admin):
                 with col_notes:
                     st.subheader("I tuoi Appunti")
                     st.caption(f"Note per: **{active_topic['titolo']}**")
-                    st.caption("Al termine dell'argomento verranno salvate e il foglio pulito.")
-                    
                     initial_notes = st.session_state.user.get('appunti_topic_corrente', "")
-                    # Usiamo key dinamica basata sul topic ID per forzare reset visivo se cambia topic
                     notes_input = st.text_area("Scrivi qui...", value=initial_notes, height=400, key=f"notes_{active_topic_id}")
-                    
                     if notes_input != initial_notes:
                         st.session_state.user['appunti_topic_corrente'] = notes_input
                         current_user_ref.update({"appunti_topic_corrente": notes_input})
         else:
             with col_live:
-                st.info("Nessun argomento attivo. Selezionane uno dalla scheda 'Gestione Argomenti'.")
+                st.info("Nessun argomento attivo.")
             with col_notes:
-                st.write("Attendi l'avvio di un argomento per prendere appunti.")
+                st.write("Attendi l'avvio di un argomento.")
 
     # ---------------------------------------------------------
     # TAB 2: GESTIONE ARGOMENTI
     # ---------------------------------------------------------
     with tab2:
         col_prop, col_hist = st.columns(2)
-        
         with col_prop:
             st.subheader("Nuova Proposta")
             with st.form("new_topic"):
@@ -259,7 +240,7 @@ else:
                 t_desc = st.text_area("Descrizione")
                 c1, c2, c3 = st.columns(3)
                 t_urgente = c1.checkbox("Urgente")
-                t_privato = c2.checkbox("Privato (Solo Capi)")
+                t_privato = c2.checkbox("Privato")
                 t_delicato = c3.checkbox("Delicato")
                 
                 if st.form_submit_button("Invia"):
@@ -281,7 +262,6 @@ else:
             for p in proposti:
                 p_data = p.to_dict()
                 if p_data.get('privato') and not is_admin: continue
-                
                 with st.expander(f"{p_data['titolo']} ({p_data['proponente']})"):
                     st.write(p_data['descrizione'])
                     lbls = []
@@ -292,18 +272,15 @@ else:
                     
                     if is_admin:
                         if st.button("Avvia Discussione", key=f"start_{p.id}"):
-                            # Chiusura forzata vecchi
                             old_active = db.collection("topics").where("stato", "==", "attivo").stream()
                             batch_start = db.batch()
-                            for old in old_active: 
-                                batch_start.update(old.reference, {"stato": "concluso"})
-                            
+                            for old in old_active: batch_start.update(old.reference, {"stato": "concluso"})
                             batch_start.update(db.collection("topics").document(p.id), {"stato": "attivo"})
                             batch_start.commit()
                             st.rerun()
 
         with col_hist:
-            st.subheader("Cronologia & Verbali")
+            st.subheader("Cronologia")
             h_stream = db.collection("topics").where("stato", "==", "concluso").stream()
             h_list = []
             for h in h_stream:
@@ -312,21 +289,16 @@ else:
                 if 'data' not in d or d['data'] is None: d['_dt'] = datetime.min
                 else: d['_dt'] = d['data']
                 h_list.append(d)
-            
             h_list.sort(key=lambda x: x['_dt'], reverse=True)
             
             for item in h_list:
                 with st.expander(f"✅ {item['titolo']}"):
                     st.caption(item.get('descrizione', ''))
-                    
-                    # Mostra note raccolte
                     notes = item.get('note_raccolte', [])
                     if notes:
-                        st.markdown("**Appunti salvati:**")
+                        st.markdown("**Appunti:**")
                         for n in notes:
                             st.markdown(f"- **{n['autore']}**: {n['testo']}")
-                    else:
-                        st.write("_Nessun appunto salvato._")
 
     # ---------------------------------------------------------
     # TAB 3: PARTECIPANTI
@@ -346,39 +318,73 @@ else:
                         st.rerun()
 
     # ---------------------------------------------------------
-    # TAB 4: ARCHIVIO
+    # TAB 4: ARCHIVIO E EXPORT (CON 3 FOGLI)
     # ---------------------------------------------------------
     with tab4:
         st.subheader("Operazioni di Archiviazione")
         
-        # 1. EXPORT EXCEL
         if 'h_list' in locals() and h_list:
+            
+            # 1. PREPARIAMO DATI FOGLIO "DETTAGLIO APPUNTI"
+            data_detailed_notes = []
+            for topic in h_list:
+                topic_title = topic['titolo']
+                notes_raw = topic.get('note_raccolte', [])
+                
+                # Se non ci sono note, inseriamo almeno una riga vuota per il topic? 
+                # Meglio di no, mettiamo solo le note esistenti.
+                if isinstance(notes_raw, list):
+                    for n in notes_raw:
+                        row = {
+                            "Argomento": topic_title,
+                            "Interlocutore": n['autore'],
+                            "Appunti Interlocutore": "",
+                            "Appunti Capo Gruppo": ""
+                        }
+                        
+                        # LOGICA DI SMISTAMENTO COLONNE
+                        # Se abbiamo salvato il ruolo, usiamolo. Altrimenti fallback a "Partecipante"
+                        user_role = n.get('ruolo', 'Partecipante')
+                        
+                        if user_role == "Capo Gruppo":
+                            row["Appunti Capo Gruppo"] = n['testo']
+                        else:
+                            row["Appunti Interlocutore"] = n['testo']
+                            
+                        data_detailed_notes.append(row)
+
+            df_detailed = pd.DataFrame(data_detailed_notes)
+
+            # 2. PREPARIAMO DATI FOGLIO "CRONOLOGIA" (Riepilogo)
+            # Usiamo clean_data_for_excel che appiattisce le note in una stringa unica
             data_topics = clean_data_for_excel(h_list)
             df_topics = pd.DataFrame(data_topics)
-            
-            # Ordine colonne preferito
-            cols = ['titolo', 'descrizione', 'note_raccolte', 'proponente', 'urgente', 'delicato']
-            # Filtra solo colonne esistenti
+            cols = ['titolo', 'descrizione', 'note_raccolte', 'proponente']
             cols = [c for c in cols if c in df_topics.columns]
             df_topics = df_topics[cols]
 
+            # 3. PREPARIAMO DATI FOGLIO "PRESENTI"
             pres_now = [u.to_dict() for u in db.collection("partecipanti").stream()]
             data_users = clean_data_for_excel(pres_now)
             df_users = pd.DataFrame(data_users)
-            # Rimuovi campo appunti tecnici dai presenti
             if 'appunti_topic_corrente' in df_users.columns:
                 df_users = df_users.drop(columns=['appunti_topic_corrente'])
 
+            # 4. SCRITTURA FILE EXCEL
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                df_topics.to_excel(writer, sheet_name='Cronologia Argomenti', index=False)
+                df_topics.to_excel(writer, sheet_name='Riepilogo Topic', index=False)
                 if not df_users.empty:
                     df_users.to_excel(writer, sheet_name='Presenti', index=False)
+                
+                # Terzo Foglio
+                if not df_detailed.empty:
+                    df_detailed.to_excel(writer, sheet_name='Dettaglio Appunti', index=False)
                 else:
-                    pd.DataFrame(["Nessuno"]).to_excel(writer, sheet_name='Presenti')
+                    pd.DataFrame(["Nessun appunto"]).to_excel(writer, sheet_name='Dettaglio Appunti')
             
             st.download_button(
-                label="Scarica Report Excel (.xlsx)",
+                label="Scarica Report Excel Completo (.xlsx)",
                 data=buffer.getvalue(),
                 file_name=f"Report_{current_title}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -388,7 +394,7 @@ else:
 
         st.divider()
 
-        # 2. SALVATAGGIO SNAPSHOT
+        # SALVATAGGIO SNAPSHOT
         archive_name = st.text_input("Nome Archivio", value=f"Sessione {datetime.now().strftime('%Y-%m-%d')}")
         if st.button("Salva Archivio nel Cloud"):
             pres_now = [u.to_dict() for u in db.collection("partecipanti").stream()]
@@ -406,7 +412,6 @@ else:
 
         st.write("---")
         st.subheader("Archivi Passati")
-        
         archives = db.collection("archivi").stream()
         for arch in archives:
             a_data = arch.to_dict()
@@ -415,16 +420,6 @@ else:
                 st.write(f"**Topics ({len(topic_list)}):**")
                 for t in topic_list:
                     st.write(f"- {t.get('titolo', '???')}")
-                    # Mostra un'anteprima delle note anche qui
-                    if t.get('note_raccolte'):
-                        st.caption(f"  *({len(t['note_raccolte'])} note salvate)*")
-
-                st.write("---")
-                user_list = a_data.get('presenti', [])
-                st.write(f"**Presenti ({len(user_list)}):**")
-                names = [u.get('nome', '?') for u in user_list]
-                st.caption(", ".join(names))
-
                 if st.button("Elimina Archivio", key=f"del_arch_{arch.id}"):
                     db.collection("archivi").document(arch.id).delete()
                     st.rerun()
