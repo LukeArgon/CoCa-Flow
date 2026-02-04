@@ -31,7 +31,8 @@ def img_to_base64(file):
 if 'user' not in st.session_state:
     col1, col2 = st.columns([1, 2])
     with col1:
-        st.image("https://cdn-icons-png.flaticon.com/512/3135/3135715.png", width=100)
+        # Icona generica
+        st.write("🔥")
     with col2:
         st.title("Benvenuto in CoCa_Flow")
         st.write("Sistema di gestione riunioni collaborativo.")
@@ -70,8 +71,13 @@ else:
         
         # Gestione Titolo Sessione (Solo Admin)
         session_ref = db.collection("config").document("sessione")
-        session_data = session_ref.get().to_dict()
-        current_title = session_data.get('titolo', "Nuova Riunione") if session_data else "Nuova Riunione"
+        session_doc = session_ref.get()
+        if session_doc.exists:
+            session_data = session_doc.to_dict()
+            current_title = session_data.get('titolo', "Nuova Riunione")
+        else:
+            current_title = "Nuova Riunione"
+            session_ref.set({"titolo": "Nuova Riunione"})
         
         if is_admin:
             new_title = st.text_input("Titolo Sessione", value=current_title)
@@ -89,7 +95,7 @@ else:
     # --- CORPO PRINCIPALE ---
     st.title(f"🔥 {current_title}")
     
-    tab1, tab2, tab3, tab4 = st.tabs(["📢 Discussione Live", "📝 Gestione Argomenti", "👥 Partecipanti", "floppy_disk: Archivio"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📢 Discussione Live", "📝 Gestione Argomenti", "👥 Partecipanti", "🗄️ Archivio"])
 
     # ---------------------------------------------------------
     # TAB 1: DISCUSSIONE LIVE (Argomento Attivo e Coda)
@@ -137,14 +143,22 @@ else:
 
                 with col_coda_list:
                     st.write("### 🗣️ Coda Interventi")
-                    queue_ref = db.collection("coda").where("topic_id", "==", active_topic_id).order_by("timestamp").stream()
+                    # FIX: Recuperiamo tutto e ordiniamo in Python per evitare errori di indice
+                    queue_ref = db.collection("coda").where("topic_id", "==", active_topic_id).stream()
                     
-                    queue_list = list(queue_ref)
+                    queue_list = []
+                    for q in queue_ref:
+                        q_data = q.to_dict()
+                        q_data['id'] = q.id
+                        queue_list.append(q_data)
+                    
+                    # Ordiniamo la lista in Python per timestamp
+                    queue_list.sort(key=lambda x: x['timestamp'])
+
                     if not queue_list:
                         st.write("Nessuno in coda.")
                     
-                    for idx, q in enumerate(queue_list):
-                        q_data = q.to_dict()
+                    for idx, q_data in enumerate(queue_list):
                         col_q1, col_q2 = st.columns([4, 1])
                         with col_q1:
                             st.write(f"**{idx + 1}. {q_data['nome']}**")
@@ -152,8 +166,8 @@ else:
                         # Gestione Admin della Coda
                         if is_admin:
                             with col_q2:
-                                if st.button("🗑️", key=f"del_{q.id}"):
-                                    db.collection("coda").document(q.id).delete()
+                                if st.button("🗑️", key=f"del_{q_data['id']}"):
+                                    db.collection("coda").document(q_data['id']).delete()
                                     st.rerun()
 
                 # Tasto per chiudere l'argomento (Admin)
@@ -163,7 +177,9 @@ else:
                         db.collection("topics").document(active_topic_id).update({"stato": "concluso", "fine": firestore.SERVER_TIMESTAMP})
                         # Pulisce la coda
                         batch = db.batch()
-                        for q in queue_list:
+                        # Nota: dobbiamo rileggere i riferimenti per cancellarli
+                        q_to_delete = db.collection("coda").where("topic_id", "==", active_topic_id).stream()
+                        for q in q_to_delete:
                             batch.delete(q.reference)
                         batch.commit()
                         st.rerun()
@@ -228,14 +244,27 @@ else:
 
         with col_hist:
             st.subheader("📜 Cronologia (Topic History)")
-            history = db.collection("topics").where("stato", "==", "concluso").order_by("data", direction=firestore.Query.DESCENDING).stream()
+            # FIX: Rimosso l'order_by nella query per evitare errore Missing Index
+            history_stream = db.collection("topics").where("stato", "==", "concluso").stream()
             
-            history_data = []
-            for h in history:
+            # Convertiamo in lista per ordinare in Python
+            history_list = []
+            for h in history_stream:
                 h_data = h.to_dict()
                 if h_data.get('privato') and not is_admin: continue
+                # Gestione sicura della data (alcune date potrebbero essere None se appena create)
+                if 'data' not in h_data or h_data['data'] is None:
+                    # Usiamo una data fittizia vecchia se manca
+                    h_data['_sort_date'] = datetime.min
+                else:
+                    h_data['_sort_date'] = h_data['data']
                 
-                history_data.append(h_data)
+                history_list.append(h_data)
+            
+            # Ordiniamo Python-side (più recente in alto)
+            history_list.sort(key=lambda x: x['_sort_date'], reverse=True)
+            
+            for h_data in history_list:
                 st.text(f"✅ {h_data['titolo']}")
                 st.caption(h_data.get('descrizione', ''))
                 st.divider()
@@ -278,19 +307,25 @@ else:
         
         # Sezione Export CSV/TXT
         st.subheader("Esporta Dati Cronologia")
-        if history_data:
-            df = pd.DataFrame(history_data)
-            # Rimuovi colonne tecniche se necessario
+        # Usiamo la lista history_list già calcolata nel Tab 2 se esiste, altrimenti ricalcoliamo
+        if 'history_list' in locals() and history_list:
+            # Pulizia dati per CSV (rimuoviamo colonne tecniche)
+            clean_history = []
+            for item in history_list:
+                clean_item = {k: v for k, v in item.items() if k != '_sort_date'}
+                clean_history.append(clean_item)
+
+            df = pd.DataFrame(clean_history)
             csv = df.to_csv(index=False).encode('utf-8')
             
             st.download_button(
                 label="Scarica Report CSV",
                 data=csv,
-                file_name=f'report_sessione_{current_title}.csv',
+                file_name=f'report_sessione.csv',
                 mime='text/csv',
             )
         else:
-            st.write("Nessun dato nella cronologia da esportare.")
+            st.write("Nessun dato concluso da esportare.")
 
         st.divider()
         
@@ -300,11 +335,17 @@ else:
         
         if st.button("Archivia Tutto Ora"):
             # Creiamo un documento snapshot
+            # Raccogliamo i dati puliti
+            all_users = [u.to_dict() for u in db.collection("partecipanti").stream()]
+            # Raccogliamo topic history (ricalcoliamo per sicurezza)
+            hist_ref = db.collection("topics").where("stato", "==", "concluso").stream()
+            hist_data_save = [h.to_dict() for h in hist_ref]
+
             snapshot = {
                 "titolo_sessione": current_title,
                 "data_archiviazione": firestore.SERVER_TIMESTAMP,
-                "topics_history": history_data,
-                "partecipanti_al_momento": [u.to_dict() for u in db.collection("partecipanti").stream()]
+                "topics_history": hist_data_save,
+                "partecipanti_al_momento": all_users
             }
             db.collection("archivi").document(archive_name).set(snapshot)
             st.success(f"Sessione '{archive_name}' archiviata con successo!")
